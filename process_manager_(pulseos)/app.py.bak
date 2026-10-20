@@ -1,0 +1,268 @@
+import time
+import platform
+from datetime import datetime
+
+import pandas as pd
+import psutil
+import plotly.express as px
+import streamlit as st
+
+st.set_page_config(
+    page_title="Process Manager",
+    page_icon="🖥️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------- Styling ----------
+st.markdown("""
+<style>
+    .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1600px;}
+    [data-testid="stMetric"] {
+        background: linear-gradient(135deg, rgba(59,130,246,.12), rgba(16,185,129,.08));
+        border: 1px solid rgba(128,128,128,.22);
+        padding: 18px 20px;
+        border-radius: 16px;
+    }
+    .hero {
+        padding: 1.2rem 1.4rem;
+        border-radius: 18px;
+        background: linear-gradient(110deg, rgba(37,99,235,.20), rgba(16,185,129,.12));
+        border: 1px solid rgba(128,128,128,.20);
+        margin-bottom: 1rem;
+    }
+    .muted {opacity: .72; font-size: .9rem;}
+    div[data-testid="stDataFrame"] {border-radius: 12px; overflow: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="hero">
+  <h1 style="margin:0">🖥️ Process Manager</h1>
+  <p style="margin:.45rem 0 0 0">Live operating-system process monitoring · CPU · memory · I/O · workload estimates</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------- State ----------
+if "io_previous" not in st.session_state:
+    st.session_state.io_previous = {}
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "last_cpu_prime" not in st.session_state:
+    # Prime per-process CPU counters so the next refresh can produce meaningful readings.
+    for p in psutil.process_iter():
+        try:
+            p.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    st.session_state.last_cpu_prime = True
+
+
+def classify(cpu, read_bps, write_bps):
+    """Transparent project heuristic, not a definitive OS classification."""
+    if cpu is None:
+        return "Unknown"
+    io_total = (read_bps or 0) + (write_bps or 0)
+    if cpu >= 20:
+        return "CPU-bound"
+    if cpu < 10 and io_total >= 64 * 1024:
+        return "I/O-bound"
+    if read_bps is None and write_bps is None:
+        return "Mixed/Unknown (I/O unavailable)"
+    return "Mixed/Unknown"
+
+
+def kind_of_process(proc, username):
+    # Approximation: OSes don't expose one universal user/system label.
+    try:
+        if username in ("root", "SYSTEM", "NT AUTHORITY\\SYSTEM"):
+            return "System"
+        if platform.system() in ("Linux", "Darwin") and proc.ppid() == 1:
+            return "System/service"
+        return "User"
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return "Unknown"
+
+
+def collect_processes():
+    now = time.monotonic()
+    rows = []
+    previous = st.session_state.io_previous
+    alive_pids = set()
+
+    for proc in psutil.process_iter():
+        try:
+            with proc.oneshot():
+                pid = proc.pid
+                alive_pids.add(pid)
+                name = proc.name() or "Unknown"
+                try:
+                    username = proc.username() or "Unknown"
+                except psutil.AccessDenied:
+                    username = "Unavailable"
+
+                cpu = proc.cpu_percent(interval=None)
+                mem = proc.memory_info().rss / (1024 * 1024)
+
+                read_bps = write_bps = None
+                try:
+                    io = proc.io_counters()
+                    current_read = getattr(io, "read_bytes", None)
+                    current_write = getattr(io, "write_bytes", None)
+                    old = previous.get(pid)
+                    if old and current_read is not None and current_write is not None:
+                        old_read, old_write, old_time = old
+                        elapsed = max(now - old_time, 0.001)
+                        read_bps = max(0, current_read - old_read) / elapsed
+                        write_bps = max(0, current_write - old_write) / elapsed
+                    if current_read is not None and current_write is not None:
+                        previous[pid] = (current_read, current_write, now)
+                except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError, NotImplementedError):
+                    pass
+
+                rows.append({
+                    "PID": pid,
+                    "Process": name,
+                    "Owner": username,
+                    "Kind": kind_of_process(proc, username),
+                    "CPU %": round(cpu, 1),
+                    "RAM MB": round(mem, 1),
+                    "Read KB/s": None if read_bps is None else round(read_bps / 1024, 1),
+                    "Write KB/s": None if write_bps is None else round(write_bps / 1024, 1),
+                    "Estimate": classify(cpu, read_bps, write_bps),
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    # Drop stale PIDs so the dictionary doesn't grow forever.
+    for pid in list(previous):
+        if pid not in alive_pids:
+            previous.pop(pid, None)
+
+    return pd.DataFrame(rows)
+
+
+with st.sidebar:
+    st.header("Controls")
+    refresh_seconds = st.slider("Refresh interval (seconds)", 2, 10, 2)
+    search = st.text_input("Search process", placeholder="Name, PID or owner")
+    kinds = st.multiselect(
+        "Process kind",
+        ["System", "System/service", "User", "Unknown"],
+        default=["System", "System/service", "User", "Unknown"],
+    )
+    estimates = st.multiselect(
+        "Workload estimate",
+        ["CPU-bound", "I/O-bound", "Mixed/Unknown", "Mixed/Unknown (I/O unavailable)", "Unknown"],
+        default=["CPU-bound", "I/O-bound", "Mixed/Unknown", "Mixed/Unknown (I/O unavailable)", "Unknown"],
+    )
+    sort_by = st.selectbox("Sort table by", ["CPU %", "RAM MB", "Process", "PID"])
+    descending = st.toggle("Descending order", value=True)
+    st.divider()
+    st.caption(f"Platform: {platform.system()} {platform.release()}")
+    st.caption("Some process details may be unavailable due to OS permissions.")
+    st.caption("Classification is a heuristic, not a definitive diagnosis.")
+
+
+@st.fragment(run_every=refresh_seconds)
+def live_dashboard():
+    df = collect_processes()
+
+    # Save a small time series for charts.
+    if not df.empty:
+        st.session_state.history.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "CPU %": float(psutil.cpu_percent(interval=None)),
+            "RAM %": float(psutil.virtual_memory().percent),
+        })
+        st.session_state.history = st.session_state.history[-60:]
+
+    total_processes = len(df)
+    cpu_overall = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_io_counters()
+    cpu_bound = int((df["Estimate"] == "CPU-bound").sum()) if total_processes else 0
+    io_bound = int((df["Estimate"] == "I/O-bound").sum()) if total_processes else 0
+
+    st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Auto-refresh every {refresh_seconds}s")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Processes", f"{total_processes:,}")
+    m2.metric("Overall CPU", f"{cpu_overall:.1f}%")
+    m3.metric("RAM in use", f"{mem.percent:.1f}%", f"{mem.used / (1024**3):.2f} / {mem.total / (1024**3):.2f} GB")
+    m4.metric("CPU-bound estimate", f"{cpu_bound}")
+    m5.metric("I/O-bound estimate", f"{io_bound}")
+
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.subheader("System utilization history")
+        hist = pd.DataFrame(st.session_state.history)
+        if not hist.empty:
+            chart_data = hist.melt(id_vars="time", var_name="Metric", value_name="Usage")
+            fig = px.line(chart_data, x="time", y="Usage", color="Metric", markers=True,
+                          title="CPU and RAM usage over recent refreshes")
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10),
+                              legend_title_text="", xaxis_title="Time", yaxis_title="Percent")
+            fig.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Collecting samples for the chart…")
+    with right:
+        st.subheader("Process workload estimates")
+        if total_processes:
+            counts = df["Estimate"].value_counts().rename_axis("Estimate").reset_index(name="Processes")
+            fig2 = px.pie(counts, names="Estimate", values="Processes", hole=.55,
+                          title="Current process classification")
+            fig2.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("No process data available.")
+
+    st.subheader("Live process table")
+    filtered = df.copy()
+    if search.strip():
+        q = search.strip().lower()
+        filtered = filtered[
+            filtered["Process"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["Owner"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["PID"].astype(str).str.contains(q, na=False)
+        ]
+    if kinds:
+        filtered = filtered[filtered["Kind"].isin(kinds)]
+    else:
+        filtered = filtered.iloc[0:0]
+    if estimates:
+        filtered = filtered[filtered["Estimate"].isin(estimates)]
+    else:
+        filtered = filtered.iloc[0:0]
+    filtered = filtered.sort_values(by=sort_by, ascending=not descending, na_position="last")
+
+    st.caption(f"Showing {len(filtered):,} of {len(df):,} processes")
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+        height=460,
+        column_config={
+            "CPU %": st.column_config.ProgressColumn("CPU %", min_value=0, max_value=100, format="%.1f%%"),
+            "RAM MB": st.column_config.NumberColumn("RAM MB", format="%.1f MB"),
+            "Read KB/s": st.column_config.NumberColumn("Read KB/s", format="%.1f"),
+            "Write KB/s": st.column_config.NumberColumn("Write KB/s", format="%.1f"),
+        },
+    )
+
+    csv = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download filtered process list (CSV)", data=csv,
+                       file_name="process_manager_processes.csv", mime="text/csv")
+
+    with st.expander("How to interpret the estimates"):
+        st.markdown("""
+        - **CPU-bound:** the sampled process CPU percentage is at least 20%.
+        - **I/O-bound:** CPU is below 10% and observed process disk read/write throughput is at least 64 KiB/s.
+        - **Mixed/Unknown:** neither rule applies or there is insufficient information.
+
+        These are simple, explainable thresholds for the student project. Real process behavior can change over time.
+        macOS may not expose per-process disk I/O counters through this library, so I/O values can show as unavailable.
+        """)
+
+live_dashboard()
